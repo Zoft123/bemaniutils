@@ -52,9 +52,7 @@ class MetalGearArcade(
 
         if reqtype == "S_SRVMSG" and reqkey == "INFO":
             # Generate system message
-            settings1_str = (
-                "2011081000:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1"
-            )
+            settings1_str = "2011081000:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1"
             settings2_str = "1,1,1,1,1,1,1,1,1,1,1,1,1,1"
 
             # Send it to the client, making sure to inform the client that it was valid.
@@ -84,7 +82,9 @@ class MetalGearArcade(
         userid = self.data.remote.user.from_refid(self.game, self.version, refid)
         if userid is None:
             root = Node.void("playerdata")
-            root.add_child(Node.s32("result", 1))  # Unclear if this is the right thing to do here.
+            root.add_child(
+                Node.s32("result", 1)
+            )  # Unclear if this is the right thing to do here.
             return root
 
         # Extract new profile info from old profile
@@ -117,7 +117,9 @@ class MetalGearArcade(
             return self.format_profile(userid, profiletypes, profile)
         else:
             root = Node.void("playerdata")
-            root.add_child(Node.s32("result", 1))  # Unclear if this is the right thing to do here.
+            root.add_child(
+                Node.s32("result", 1)
+            )  # Unclear if this is the right thing to do here.
             return root
 
     def handle_playerdata_usergamedata_scorerank_request(self, request: Node) -> Node:
@@ -144,211 +146,182 @@ class MetalGearArcade(
         return root
 
     def handle_matching_request_request(self, request: Node) -> Node:
-        # Stand up this client as a possible matching host in the future.
         refid = request.child_value("data/eaid")
         userid = self.data.remote.user.from_refid(self.game, self.version, refid)
+
+        root = Node.void("matching")
+
         if userid is None:
-            root = Node.void("matching")
-            root.add_child(Node.s32("result", -1))  # Set to error so matching doesn't happen.
+            root.add_child(Node.s32("result", -1))
             return root
 
-        # Game sends how long it intends to wait, so we should use that.
-        wait_time = request.child_value("data/waittime")
+        matchgrp = request.child_value("data/matchgrp")
+        waituser = request.child_value("data/waituser")
+        waittime = request.child_value("data/waittime")
 
-        # Look up active lobbies, see if there was a previous one for us.
-        # Matchmaking takes at most 60 seconds, so assume any lobbies older
-        # than this are dead.
-        lobbies = self.data.local.lobby.get_all_lobbies(self.game, self.version, max_age=wait_time)
-        previous_hosted_lobbies = [True for uid, _ in lobbies if uid == userid]
-        previous_joined_lobbies = [(uid, lobby) for uid, lobby in lobbies if userid in lobby["participants"]]
+        joinip = request.child_value("data/joinip")
+        joinport = request.child_value("data/joinport")
+        localip = request.child_value("data/localip")
+        localport = request.child_value("data/localport")
 
-        # See if there's a random lobby we can be slotted into. Don't choose potentially
-        # our old one, since it will be overwritten by a new entry, if we were ever a host.
-        nonfull_lobbies = [(uid, lobby) for uid, lobby in lobbies if len(lobby["participants"]) < lobby["lobbysize"]]
-
-        # Make sure to put our session information somewhere that we can find again.
+        # Save connection info
         self.data.local.lobby.put_play_session_info(
             self.game,
             self.version,
             userid,
             {
-                "joinip": request.child_value("data/joinip"),
-                "joinport": request.child_value("data/joinport"),
-                "localip": request.child_value("data/localip"),
-                "localport": request.child_value("data/localport"),
+                "joinip": joinip,
+                "joinport": joinport,
+                "localip": localip,
+                "localport": localport,
                 "pcbid": self.config.machine.pcbid,
+                "time": Time.now(),
             },
         )
 
-        play_session_info = self.data.local.lobby.get_play_session_info(
+        # Look for compatible existing session
+        sessions = self.data.local.lobby.get_all_lobbies(
             self.game,
             self.version,
-            userid,
+            max_age=waittime,
         )
 
-        if (nonfull_lobbies or previous_joined_lobbies) and not previous_hosted_lobbies:
-            if previous_joined_lobbies:
-                # If we're already "in" a lobby, we should go back to that one.
-                uid, lobby = previous_joined_lobbies[0]
-            else:
-                # Pick a random one, assign ourselves to it.
-                uid, lobby = random.choice(nonfull_lobbies)
+        for host_uid, lobby in sessions:
+            if (
+                lobby.get_int("matchgrp") == matchgrp
+                and not lobby.get_bool("finalized")
+                and len(lobby["participants"]) < lobby.get_int("waituser")
+            ):
+                # Join existing
+                participants = set(lobby["participants"])
+                participants.add(userid)
+                lobby["participants"] = list(participants)
+                self.data.local.lobby.put_lobby(
+                    self.game, self.version, host_uid, lobby
+                )
 
-            # Look up the host's information.
-            host_play_session_info = self.data.local.lobby.get_play_session_info(
-                self.game,
-                self.version,
-                uid,
-            )
+                host_info = self.data.local.lobby.get_play_session_info(
+                    self.game,
+                    self.version,
+                    host_uid,
+                )
 
-            # Join this lobby.
-            participants = set(lobby["participants"])
-            participants.add(userid)
-            lobby["participants"] = list(participants)
-            self.data.local.lobby.put_lobby(self.game, self.version, uid, lobby)
+                root.add_child(Node.s32("result", 1))  # guest
+                root.add_child(Node.s64("hostid", lobby.get_int("id")))
+                root.add_child(Node.string("hostip_g", host_info.get_str("joinip")))
+                root.add_child(Node.s32("hostport_g", host_info.get_int("joinport")))
+                root.add_child(Node.string("hostip_l", host_info.get_str("localip")))
+                root.add_child(Node.s32("hostport_l", host_info.get_int("localport")))
+                return root
 
-            # Now that we've joined the lobby, tell the game about our host ID.
-            root = Node.void("matching")
-            root.add_child(
-                Node.s32("result", 1)
-            )  # Setting this to 1 makes the client consider itself a guest and join a host.
-            root.add_child(Node.s64("hostid", lobby.get_int("id")))
-            root.add_child(Node.string("hostip_g", host_play_session_info.get_str("joinip")))
-            root.add_child(Node.s32("hostport_g", host_play_session_info.get_int("joinport")))
-            root.add_child(Node.string("hostip_l", host_play_session_info.get_str("localip")))
-            root.add_child(Node.s32("hostport_l", host_play_session_info.get_int("localport")))
-            return root
+        # No session found ? create new host session
+        hostid = Time.now()  # stable 64-bit unique value
 
-        # The game does weird things if you let it wait as long as its own countdown,
-        # so subtract a bit of wiggle-room from the wait time as reported by the game.
-        wait_time -= 1
-
-        # Create a lobby with this player as the "host", since there are no non-full lobbies
-        # or we were previously a host and want to be one again.
         self.data.local.lobby.put_lobby(
             self.game,
             self.version,
             userid,
             {
-                "matchgrp": request.child_value("data/matchgrp"),
-                "lobbysize": request.child_value("data/waituser"),
-                "waittime": wait_time,
+                "id": hostid,
+                "matchgrp": matchgrp,
+                "waituser": waituser,
+                "waittime": waittime,
                 "createtime": Time.now(),
                 "participants": [userid],
+                "finalized": False,
             },
         )
-        lobby = self.data.local.lobby.get_lobby(
-            self.game,
-            self.version,
-            userid,
-        )
 
-        # Now that we've created a lobby for ourselves, tell the game about our host ID.
-        root = Node.void("matching")
-        root.add_child(
-            Node.s32("result", 0)
-        )  # Setting this to 0 makes the client consider itself a host and listen for guests.
-        root.add_child(Node.s64("hostid", lobby.get_int("id")))
-        root.add_child(Node.string("hostip_g", play_session_info.get_str("joinip")))
-        root.add_child(Node.s32("hostport_g", play_session_info.get_int("joinport")))
-        root.add_child(Node.string("hostip_l", play_session_info.get_str("localip")))
-        root.add_child(Node.s32("hostport_l", play_session_info.get_int("localport")))
+        root.add_child(Node.s32("result", 0))  # host
+        root.add_child(Node.s64("hostid", hostid))
+        root.add_child(Node.string("hostip_g", joinip))
+        root.add_child(Node.s32("hostport_g", joinport))
+        root.add_child(Node.string("hostip_l", localip))
+        root.add_child(Node.s32("hostport_l", localport))
         return root
 
     def handle_matching_wait_request(self, request: Node) -> Node:
-        host_id = request.child_value("data/hostid")
+        hostid = request.child_value("data/hostid")
 
-        # List all lobbies out, find the one that we're either a host or a guest of.
-        lobbies = self.data.local.lobby.get_all_lobbies(self.game, self.version)
-        info_by_uid = {
-            uid: data for uid, data in self.data.local.lobby.get_all_play_session_infos(self.game, self.version)
-        }
+        root = Node.void("matching")
 
-        # We should be able to filter by host_id that the game gave us.
-        joined_lobby = [(uid, lobby) for uid, lobby in lobbies if lobby.get_int("id") == host_id]
-        if len(joined_lobby) != 1:
-            # This shouldn't happen.
-            root = Node.void("matching")
+        sessions = self.data.local.lobby.get_all_lobbies(self.game, self.version)
+        session = None
+        host_uid = None
+
+        for uid, lobby in sessions:
+            if lobby.get_int("id") == hostid:
+                session = lobby
+                host_uid = uid
+                break
+
+        if session is None:
             root.add_child(Node.s32("result", -1))
             return root
 
-        # Calculate creation time, figure out when to join the match after that.
-        host_uid, lobby = joined_lobby[0]
-        time_left = max(lobby.get_int("waittime") - (Time.now() - lobby.get_int("createtime")), 0)
+        elapsed = Time.now() - session.get_int("createtime")
+        time_left = max(session.get_int("waittime") - elapsed, 0)
+
+        participants = session["participants"]
+
+        # If full or timer expired ? start match
+        if len(participants) >= session.get_int("waituser") or time_left == 0:
+            root.add_child(Node.s32("result", len(participants)))
+
+            matchlist = Node.void("matchlist")
+            root.add_child(matchlist)
+
+            count = 0
+            for uid in participants[:8]:
+                info = self.data.local.lobby.get_play_session_info(
+                    self.game,
+                    self.version,
+                    uid,
+                )
+                if not info:
+                    continue
+
+                record = Node.void("record")
+                record.add_child(Node.string("pcbid", info.get_str("pcbid")))
+                record.add_child(Node.string("statusflg", "0"))
+                record.add_child(Node.s32("matchgrp", session.get_int("matchgrp")))
+                record.add_child(Node.s64("hostid", hostid))
+                record.add_child(Node.u64("jointime", info.get_int("time") * 1000))
+                record.add_child(Node.string("connip_g", info.get_str("joinip")))
+                record.add_child(Node.s32("connport_g", info.get_int("joinport")))
+                record.add_child(Node.string("connip_l", info.get_str("localip")))
+                record.add_child(Node.s32("connport_l", info.get_int("localport")))
+
+                matchlist.add_child(record)
+                count += 1
+
+            matchlist.add_child(Node.u32("record_num", count))
+            return root
+
+        # Not ready yet
+        root.add_child(Node.s32("result", 0))
+        root.add_child(Node.s32("prwtime", time_left))
+        return root
+
+    def handle_matching_finish_request(self, request: Node) -> Node:
+        hostid = request.child_value("data/hostid")
 
         root = Node.void("matching")
-        root.add_child(Node.s32("result", 0 if time_left > 0 else 1))  # We send 1 to start the match.
-        root.add_child(Node.s32("prwtime", time_left))
-        matchlist = Node.void("matchlist")
-        root.add_child(matchlist)
 
-        playercount = 0
-        for uid in lobby["participants"]:
-            # Grab player-specific IPs and stuff.
-            if uid not in info_by_uid:
-                continue
-            uinfo = info_by_uid[uid]
+        sessions = self.data.local.lobby.get_all_lobbies(self.game, self.version)
 
-            # Technically, the game only takes up to 8 of these records, but we only
-            # let users join the lobbies based on the size that the game requests. So,
-            # we don't need to worry about that.
-            playercount += 1
+        for uid, lobby in sessions:
+            if lobby.get_int("id") == hostid:
+                lobby["finalized"] = True
+                self.data.local.lobby.put_lobby(self.game, self.version, uid, lobby)
+                break
 
-            record = Node.void("record")
-            record.add_child(Node.string("pcbid", uinfo.get_str("pcbid")))
-            record.add_child(Node.string("statusflg", ""))
-            record.add_child(Node.s32("matchgrp", lobby.get_int("matchgrp")))
-            record.add_child(Node.s64("hostid", lobby.get_int("id")))
-            record.add_child(Node.u64("jointime", uinfo.get_int("time") * 1000))
-            record.add_child(Node.string("connip_g", uinfo.get_str("joinip")))
-            record.add_child(Node.s32("connport_g", uinfo.get_int("joinport")))
-            record.add_child(Node.string("connip_l", uinfo.get_str("localip")))
-            record.add_child(Node.s32("connport_l", uinfo.get_int("localport")))
-            matchlist.add_child(record)
-
-        matchlist.add_child(Node.u32("record_num", playercount))
-
-        return root
-
-    def format_profile(self, userid: UserID, profiletypes: List[str], profile: Profile) -> Node:
-        root = Node.void("playerdata")
         root.add_child(Node.s32("result", 0))
-        player = Node.void("player")
-        root.add_child(player)
-        records = 0
-        record = Node.void("record")
-        player.add_child(record)
-
-        for profiletype in profiletypes:
-            if profiletype == "3fffffffff":
-                continue
-            for j in range(len(profile["strdatas"])):
-                strdata = profile["strdatas"][j]
-                bindata = profile["bindatas"][j]
-
-                # Figure out the profile type
-                csvs = strdata.split(b",")
-                if len(csvs) < 2:
-                    # Not long enough to care about
-                    continue
-                datatype = csvs[1].decode("ascii")
-                if datatype != profiletype:
-                    # Not the right profile type requested
-                    continue
-
-                # This is a valid profile node for this type, lets return only the profile values
-                strdata = b",".join(csvs[2:])
-                d = Node.string("d", base64.b64encode(strdata).decode("ascii"))
-                record.add_child(d)
-                d.add_child(Node.string("bin1", base64.b64encode(bindata).decode("ascii")))
-
-                # Remember that we had this record
-                records = records + 1
-
-        player.add_child(Node.u32("record_num", records))
         return root
 
-    def unformat_profile(self, userid: UserID, request: Node, oldprofile: Profile, is_new: bool) -> Profile:
+    def unformat_profile(
+        self, userid: UserID, request: Node, oldprofile: Profile, is_new: bool
+    ) -> Profile:
         # Profile save request, data values are base64 encoded.
         # d is a CSV, and bin1 is binary data.
         newprofile = oldprofile.clone()
